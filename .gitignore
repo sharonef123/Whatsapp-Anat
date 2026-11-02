@@ -1,0 +1,13 @@
+# Private chat data - never commit
+*.txt
+*.zip
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.opus
+*.mp4
+*.pdf
+*.vcf
+processed_chat_data*.json
+export/
