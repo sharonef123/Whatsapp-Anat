@@ -48,7 +48,7 @@ SYSTEM_RE = re.compile(r"^\[?\d{1,2}[./-]\d{1,2}[./-]\d{2,4},?\s+\d{1,2}:\d{2}")
 # ---------- Attachments ----------
 ATTACH_PATTERNS = [
     re.compile(r"<(?:attached|מצורף|מצורפת)\s*:\s*([^>]+)>", re.I),                       # iOS
-    re.compile(r"^(.+?\.[A-Za-z0-9]{2,5})\s*\((?:file attached|קובץ מצורף)\)", re.I),     # Android
+    re.compile(r"^(.+?(?:\.[A-Za-z0-9]{0,5})?)\s*\((?:file attached|קובץ מצורף)\)", re.I),     # Android
 ]
 OMITTED_RE = re.compile(
     r"<(?:Media omitted|המדיה לא נכללה|מדיה הושמטה)>|\b(image|audio|video|document|sticker|GIF) omitted\b"
@@ -66,22 +66,40 @@ TYPE_BY_EXT = {
 OCR_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff"}
 
 # ---------- Financial detection ----------
-FIN_KEYWORDS = [
-    # Hebrew
-    "קבלה", "קבלות", "חשבונית", "חשבוניות", "חשבון עסקה", "אישור תשלום", "שולם", "שילמתי", "שילמת",
-    "תשלום", "העברה בנקאית", "העברתי", "העברת", "ביט", "פייבוקס", "אסמכתא", "החזר", "הוראת קבע",
-    "כרטיס אשראי", "זיכוי", "חיוב", "מע\"מ", "סכום", "מזונות", "שכר לימוד", "הוצאות",
-    # English
-    "receipt", "invoice", "payment", "paid", "bank transfer", "refund", "confirmation number",
-    "transaction", "credit card", "vat", "paybox", "total",
+# Three levels:
+#   DOC_KW   - words that appear ON receipts / invoices / payment confirmations
+#   PAID_KW  - statements that a payment was actually made
+#   TOPIC_KW - money talk (alimony, expenses, debts) - relevant context, but not a receipt
+DOC_KW = [
+    "קבלה", "קבלות", "חשבונית", "חשבוניות", "חשבון עסקה", "חשבונית מס", "אישור תשלום", "אישור העברה",
+    "אסמכתא", "מספר עסקה", "מס' עסקה", "העברה בנקאית", "הוראת קבע", "ביט", "פייבוקס", "סה\"כ", "סה״כ",
+    "receipt", "invoice", "paybox", "bit", "confirmation number", "transaction", "total", "amount paid",
+]
+PAID_KW = ["שולם", "שולמה", "שולמו", "שילמתי", "העברתי", "הועבר", "הועברה", "הועברו", "paid", "payment received"]
+TOPIC_KW = [
+    "תשלום", "תשלומים", "לשלם", "משלם", "משלמת", "שילמת", "שילמה", "העברת", "החזר", "החזרים", "הוצאות",
+    "הוצאה", "סכום", "סכומים", "מזונות", "חיוב", "חיובים", "זיכוי", "חוב", "חובות", "כסף", "כרטיס אשראי",
+    "מע\"מ", "שכר לימוד", "הוצאה לפועל", "payment", "refund", "credit card", "vat",
 ]
 FIN_FILENAME_HINTS = ["receipt", "invoice", "kabala", "heshbonit", "payment", "קבלה", "חשבונית", "תשלום"]
 AMOUNT_RE = re.compile(r"(?:₪\s?\d[\d,.]*|\d[\d,.]*\s?(?:₪|ש\"ח|ש״ח|שח|nis|ils)(?![א-תA-Za-z]))", re.I)
-WORD_BOUNDARY_KW = {"paid", "vat", "total", "ביט"}  # short keywords that need whole-word matching
+HEB_PREFIX = "[והבלמשכ]{0,2}"
+
+
+def _kw_regex(words):
+    alts = []
+    for w in sorted(words, key=len, reverse=True):
+        e = re.escape(w.lower())
+        alts.append(HEB_PREFIX + e if re.match(r"[א-ת]", w) else e)
+    return re.compile(r"(?<![\wא-ת])(?:" + "|".join(alts) + r")(?![\wא-ת])", re.I)
+
+
+DOC_RE, PAID_RE, TOPIC_RE = _kw_regex(DOC_KW), _kw_regex(PAID_KW), _kw_regex(TOPIC_KW)
+STRICT_CATEGORIES = {"receipt_document", "payment_confirmation", "receipt_context"}
 
 PARTY_A, PARTY_B, PARTY_OTHER = "A", "B", "C"
 DEFAULT_LABELS = {
-    PARTY_A: "צד א' (הדרושה)",
+    PARTY_A: "צד א' (הגרושה)",
     PARTY_B: "צד ב' (אני)",
     PARTY_OTHER: "צד שלישי",
 }
@@ -94,23 +112,36 @@ def log(msg):
 
 # ---------- Financial ----------
 def financial_signals(*texts, filename=None):
-    signals = []
+    """Return {"doc": [...], "paid": [...], "topic": [...], "amount": [...], "filename": [...]}."""
+    sig = {"doc": set(), "paid": set(), "topic": set(), "amount": set(), "filename": set()}
     for text in texts:
         if not text:
             continue
-        low = text.lower()
-        for amt in AMOUNT_RE.findall(text):
-            signals.append(f"amount:{amt.strip()}")
-        for k in FIN_KEYWORDS:
-            kl = k.lower()
-            if kl in WORD_BOUNDARY_KW:
-                if re.search(rf"(?<![\w]){re.escape(kl)}(?![\w])", low):
-                    signals.append(f"keyword:{k}")
-            elif kl in low:
-                signals.append(f"keyword:{k}")
+        sig["amount"].update(a.strip() for a in AMOUNT_RE.findall(text))
+        for key, rx in (("doc", DOC_RE), ("paid", PAID_RE), ("topic", TOPIC_RE)):
+            sig[key].update(m.group(0).strip() for m in rx.finditer(text))
     if filename and any(h in filename.lower() for h in FIN_FILENAME_HINTS):
-        signals.append(f"filename:{filename}")
-    return sorted(set(signals))
+        sig["filename"].add(filename)
+    return sig
+
+
+LONG_DOC_CHARS = 5000  # letters / long documents mention money but are not receipts
+
+
+def classify_financial(sig, has_media, extracted_len=0):
+    if has_media and extracted_len > LONG_DOC_CHARS and not sig["filename"]:
+        return "money_discussion" if any(sig.values()) else None
+    if has_media and (sig["doc"] or sig["filename"] or (sig["amount"] and (sig["paid"] or sig["topic"]))):
+        return "receipt_document"
+    if not has_media and (sig["paid"] or (sig["amount"] and sig["doc"])):
+        return "payment_confirmation"
+    if any(sig.values()):
+        return "money_discussion"
+    return None
+
+
+def flatten_signals(sig):
+    return [f"{k}:{v}" for k in ("filename", "doc", "paid", "amount", "topic") for v in sorted(sig[k])]
 
 
 # ---------- Input discovery ----------
@@ -253,6 +284,10 @@ class Extractor:
                         parts = [self._ocr(p) for p in sorted(Path(td).glob("p*.png"))]
                     return clean("\n".join(parts)), f"pdf_ocr:{self.langs}"
                 return None, "pdf_tools_unavailable"
+            if ext in {".html", ".htm"}:
+                raw = path.read_text(encoding="utf-8", errors="replace")
+                raw = re.sub(r"(?is)<(script|style).*?</\1>", " ", raw)
+                return clean(re.sub(r"<[^>]+>", " ", raw)), "html_text"
             if ext in {".txt", ".csv", ".vcf"}:
                 return clean(path.read_text(encoding="utf-8", errors="replace")[:5000]), "plain_text"
             if media_type(path.name) == "audio":
@@ -384,6 +419,7 @@ def main():
             "response_delay_minutes": delay,
             "media": None,
             "related_media_ids": [],
+            "financial_category": None,
             "financial_signals": [],
             "_dt": m["dt"],
             "_att": att,
@@ -454,22 +490,26 @@ def main():
             "context_after": [ctx(o) for o in records[idx + 1:hi]],
         }
 
-    # 6. Financial flags (message text + caption + linked text + OCR + filename), propagated to linked texts
+    # 6. Financial classification (text + caption + linked text + OCR + filename)
     for r in records:
         md = r["media"] or {}
-        sig = financial_signals(r["message"] if not r["_att"] else r["_caption"],
-                                md.get("linked_text"), md.get("extracted_text"),
-                                filename=r["_att"])
-        r["financial_signals"] = sig
-        r["is_financial_or_receipt"] = bool(sig)
+        has_file = bool(r["_att"])
+        texts = [r["_caption"] if has_file else r["message"], md.get("linked_text"), md.get("extracted_text")]
+        if not has_file:
+            texts = [r["message"]]
+        sig = financial_signals(*texts, filename=r["_att"])
+        r["financial_category"] = classify_financial(sig, has_file, len(md.get("extracted_text") or ""))
+        r["financial_signals"] = flatten_signals(sig)
     by_id = {r["id"]: r for r in records}
-    for r in records:
-        if r["media"] and r["is_financial_or_receipt"]:
+    for r in records:  # text sent with a receipt is part of that receipt's record
+        if r["financial_category"] == "receipt_document":
             for lid in r["media"]["linked_message_ids"]:
                 o = by_id[lid]
-                if not o["is_financial_or_receipt"]:
-                    o["is_financial_or_receipt"] = True
-                    o["financial_signals"].append(f"linked_to_financial_media:{r['id']}")
+                if o["financial_category"] not in STRICT_CATEGORIES:
+                    o["financial_category"] = "receipt_context"
+                    o["financial_signals"].append(f"linked_to_receipt:{r['id']}")
+    for r in records:
+        r["is_financial_or_receipt"] = r["financial_category"] in STRICT_CATEGORIES
 
     # 7. Output
     for r in records:
@@ -479,10 +519,13 @@ def main():
     fin = [r for r in records if r["is_financial_or_receipt"]]
     fin_path = out_path.with_name(out_path.stem + "_financial.json")
     fin_path.write_text(json.dumps(fin, ensure_ascii=False, indent=2), encoding="utf-8")
+    money = [r for r in records if r["financial_category"] == "money_discussion"]
+    money_path = out_path.with_name(out_path.stem + "_money_discussion.json")
+    money_path.write_text(json.dumps(money, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 8. Summary
     in_window_files = {nm for nm in media_index
-                       if (d := file_date(nm)) is None or d >= since.date()}
+                       if (d := file_date(nm)) is not None and d >= since.date()}
     unreferenced = sorted(in_window_files - referenced)
     print("\n========== SUMMARY ==========")
     print(f"Messages total in export : {len(all_msgs)}")
@@ -510,7 +553,9 @@ def main():
     print(f"Media referenced/missing : {len(missing)}" + (f"  e.g. {missing[:5]}" if missing else ""))
     print(f"Media omitted in export  : {sum(1 for r in records if r['media'] and r['media']['omitted_in_export'])}")
     print(f"Files on disk (in window) not referenced: {len(unreferenced)}" + (f"  e.g. {unreferenced[:5]}" if unreferenced else ""))
-    print(f"Financial / receipt flags: {len(fin)}  -> {fin_path.name}")
+    print(f"Financial categories     : {dict(Counter(r['financial_category'] for r in records if r['financial_category']))}")
+    print(f"Receipts / payments (strict): {len(fin)}  -> {fin_path.name}")
+    print(f"Money discussion (context)  : {len(money)}  -> {money_path.name}")
     print(f"Output                   : {out_path}")
     if tmp:
         tmp.cleanup()
