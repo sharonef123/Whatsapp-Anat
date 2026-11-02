@@ -13,3 +13,4 @@ processed_chat_data*.json
 export/
 __pycache__/
 *.pyc
+reports/
