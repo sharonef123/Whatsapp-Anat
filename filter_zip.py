@@ -50,6 +50,7 @@ def main():
     ap.add_argument("zip", help="WhatsApp export ZIP")
     ap.add_argument("--since", default="2026-06-01", help="YYYY-MM-DD (default 2026-06-01)")
     ap.add_argument("--out", help="output ZIP path")
+    ap.add_argument("--add", nargs="*", default=[], help="extra files to put in the ZIP root (e.g. timeline.html, conduct_report.xlsx)")
     ap.add_argument("--monthfirst", action="store_true", help="dates in the chat are M/D/Y (US phones)")
     args = ap.parse_args()
 
@@ -105,6 +106,8 @@ def main():
                     written.add(arc)
                     # media is already compressed; store as-is
                     dst.writestr(zipfile.ZipInfo(arc, info.date_time), src.read(info), zipfile.ZIP_STORED)
+            for extra in args.add:
+                dst.write(extra, PurePosixPath(extra.replace("\\", "/")).name)
             dst.writestr("media_manifest.txt", ("date\tsender\tfile\tstatus\n" + "\n".join(manifest) + "\n").encode("utf-8"))
 
     print(f"Chat file:   {chat.filename}")
